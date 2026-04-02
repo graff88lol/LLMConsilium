@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: debate-agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+    spec:
+      containers:
+      - name: orchestrator
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            pip install fastapi uvicorn aiohttp
+            cat > /app/main.py << 'INNEREOF'
+            import asyncio
+            import aiohttp
+            from fastapi import FastAPI
+            from pydantic import BaseModel
+            import os
+            
+            app = FastAPI()
+            
+            GENERATOR_URL = "http://generator-svc:11434"
+            CRITIC_URL = "http://critic-svc:11434"
+            
+            class DebateRequest(BaseModel):
+                task: str
+                max_rounds: int = 3
+            
+            async def call_ollama(url: str, prompt: str, model: str) -> str:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{url}/api/generate",
+                        json={
+                            "model": model,
+                            "prompt": prompt,
+                            "stream": False,
+                            "options": {"temperature": 0.7}
+                        },
+                        timeout=aiohttp.ClientTimeout(total=120)
+                    ) as resp:
+                        data = await resp.json()
+                        return data.get("response", "")
+            
+            @app.post("/debate")
+            async def debate(request: DebateRequest):
+                code = await call_ollama(
+                    GENERATOR_URL,
+                    f"Ты senior developer. Напиши только код на Python.\nЗадача: {request.task}",
+                    "deepseek-coder:6.7b"
+                )
+                
+                history = []
+                
+                for round_num in range(request.max_rounds):
+                    critique = await call_ollama(
+                        CRITIC_URL,
+                        f"Ты security expert. Найди проблемы в коде.\nКод:\n{code}\nЕсли проблем нет, напиши 'OK'.",
+                        "qwen2.5-coder:7b"
+                    )
+                    
+                    history.append({
+                        "round": round_num + 1,
+                        "code": code,
+                        "critique": critique
+                    })
+                    
+                    if "OK" in critique.upper():
+                        break
+                    
+                    code = await call_ollama(
+                        GENERATOR_URL,
+                        f"Исправь код по замечаниям.\nЗамечания: {critique}\n\nКод:\n{code}\nВыдай исправленный код.",
+                        "deepseek-coder:6.7b"
+                    )
+                
+                return {
+                    "final_code": code,
+                    "rounds": len(history),
+                    "history": history
+                }
+            
+            @app.get("/health")
+            async def health():
+                return {"status": "ok"}
+            
+            if __name__ == "__main__":
+                import uvicorn
+                uvicorn.run(app, host="0.0.0.0", port=8080)
+            INNEREOF
+            python /app/main.py
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        ports:
+        - containerPort: 8080
+          name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator-svc
+  namespace: debate-agents
+spec:
+  selector:
+    app: orchestrator
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: NodePort

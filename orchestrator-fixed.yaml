@@ -1,0 +1,165 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: debate-agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+    spec:
+      containers:
+      - name: orchestrator
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            mkdir -p /app
+            pip install fastapi uvicorn aiohttp
+            cat > /app/main.py << 'INNEREOF'
+            import asyncio
+            import aiohttp
+            from fastapi import FastAPI
+            from pydantic import BaseModel
+            import logging
+            
+            logging.basicConfig(level=logging.INFO)
+            logger = logging.getLogger(__name__)
+            
+            app = FastAPI()
+            
+            GENERATOR_URL = "http://generator-svc:11434"
+            CRITIC_URL = "http://critic-svc:11434"
+            
+            class DebateRequest(BaseModel):
+                task: str
+                max_rounds: int = 3
+            
+            async def wait_for_service(url: str, max_retries: int = 60):
+                """Ожидание готовности Ollama сервиса"""
+                for i in range(max_retries):
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(f"{url}/api/tags", timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                                if resp.status == 200:
+                                    logger.info(f"Service ready: {url}")
+                                    return True
+                    except:
+                        pass
+                    if i % 10 == 0:
+                        logger.info(f"Waiting for {url}... ({i}/{max_retries})")
+                    await asyncio.sleep(2)
+                logger.error(f"Service not ready: {url}")
+                return False
+            
+            async def call_ollama(url: str, prompt: str, model: str) -> str:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{url}/api/generate",
+                        json={
+                            "model": model,
+                            "prompt": prompt,
+                            "stream": False,
+                            "options": {"temperature": 0.7}
+                        },
+                        timeout=aiohttp.ClientTimeout(total=120)
+                    ) as resp:
+                        data = await resp.json()
+                        return data.get("response", "")
+            
+            @app.on_event("startup")
+            async def startup_event():
+                logger.info("Checking service dependencies...")
+                generator_ready = await wait_for_service(GENERATOR_URL)
+                critic_ready = await wait_for_service(CRITIC_URL)
+                if not generator_ready or not critic_ready:
+                    logger.error("Services not ready, but continuing...")
+                else:
+                    logger.info("All services are ready!")
+            
+            @app.post("/debate")
+            async def debate(request: DebateRequest):
+                logger.info(f"Starting debate for task: {request.task}")
+                
+                # Проверяем что сервисы живы
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        await session.get(f"{GENERATOR_URL}/api/tags")
+                        await session.get(f"{CRITIC_URL}/api/tags")
+                except Exception as e:
+                    logger.error(f"Services not reachable: {e}")
+                    return {"error": "Ollama services not ready"}
+                
+                code = await call_ollama(
+                    GENERATOR_URL,
+                    f"Ты senior developer. Напиши только код на Python без пояснений.\nЗадача: {request.task}",
+                    "deepseek-coder:6.7b"
+                )
+                
+                history = []
+                
+                for round_num in range(request.max_rounds):
+                    critique = await call_ollama(
+                        CRITIC_URL,
+                        f"Ты security expert. Найди проблемы в коде.\nКод:\n{code}\nЕсли проблем нет, напиши 'OK'.",
+                        "qwen2.5-coder:7b"
+                    )
+                    
+                    history.append({
+                        "round": round_num + 1,
+                        "code": code,
+                        "critique": critique
+                    })
+                    
+                    if "OK" in critique.upper():
+                        break
+                    
+                    code = await call_ollama(
+                        GENERATOR_URL,
+                        f"Исправь код по замечаниям.\nЗамечания: {critique}\n\nКод:\n{code}\nВыдай исправленный код без пояснений.",
+                        "deepseek-coder:6.7b"
+                    )
+                
+                return {
+                    "final_code": code,
+                    "rounds": len(history),
+                    "history": history
+                }
+            
+            @app.get("/health")
+            async def health():
+                return {"status": "ok"}
+            
+            if __name__ == "__main__":
+                import uvicorn
+                uvicorn.run(app, host="0.0.0.0", port=8000)
+            INNEREOF
+            python /app/main.py
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        ports:
+        - containerPort: 8000
+          name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator-svc
+  namespace: debate-agents
+spec:
+  selector:
+    app: orchestrator
+  ports:
+  - port: 8080
+    targetPort: 8000
+  type: NodePort
