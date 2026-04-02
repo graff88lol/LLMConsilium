@@ -1,0 +1,11 @@
+{
+  "final_code": "def hello_world():\n    print(\"Hello World!\")  # Приветствие, а не просто \"hi\"\n    \nhello_world()  \n",
+  "rounds": 1,
+  "history": [
+    {
+      "round": 1,
+      "code": "def hello_world():\n    print(\"Hello World!\")  # Приветствие, а не просто \"hi\"\n    \nhello_world()  \n",
+      "critique": "OK"
+    }
+  ]
+}
